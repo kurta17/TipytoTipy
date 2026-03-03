@@ -1,11 +1,14 @@
 """
-tests.py — Performance benchmarks, isolation test, and demo entry point.
+tests.py — Performance benchmarks, isolation tests, and demo entry point.
 
 Responsibilities:
-  • perf_test_create_users         — PERF-1: throughput of user creation
-  • perf_test_process_payments     — PERF-2: throughput of payment processing
-  • isolation_test_concurrent_payments — ISOLATION: concurrent wallet debits
-  • main                           — end-to-end demo runner
+  • perf_test_create_users                  — PERF-1: throughput of user creation
+  • perf_test_process_payments              — PERF-2: throughput of payment processing
+  • isolation_test_concurrent_payments      — ISOLATION-1: concurrent wallet debits
+  • isolation_test_idempotent_payment       — ISOLATION-2: same schedule_id, N threads
+  • isolation_test_concurrent_match_approval— ISOLATION-3: concurrent loan finalisation
+  • isolation_test_unique_email_signup      — ISOLATION-4: duplicate email registration
+  • main                                    — end-to-end demo runner
 
 Usage:
     export DATABASE_URL="postgresql://user:pass@localhost:5432/tipytotipy"
@@ -21,7 +24,10 @@ from typing import List
 
 from models import (
     GrantedLoan,
+    LendingOffer,
+    LoanMatch,
     LoanRequest,
+    MatchStatus,
     PaymentSchedule,
     PaymentStatus,
     User,
@@ -312,6 +318,376 @@ def isolation_test_concurrent_payments(n_threads: int = 10) -> None:
             print(f"    ↳ paid({paid}) + missed({missed}) ≠ {n_threads} — rows missing.")
 
 
+# ─── ISOLATION-2: idempotent payment processing ──────────────────────────────────
+
+def isolation_test_idempotent_payment(n_threads: int = 10) -> None:
+    """
+    ISOLATION TEST 2 — Proves that the PaymentSchedule status guard prevents a
+    single instalment from being debited more than once, even when N threads race
+    to process the exact same schedule_id simultaneously.
+
+    Scenario
+    --------
+    • One borrower wallet, balance = $500
+    • One PaymentSchedule for $200 linked to that wallet
+    • n_threads all call op_process_payment() with the SAME schedule_id
+
+    Mechanism
+    ---------
+    Thread 1 acquires SELECT FOR UPDATE on the schedule row, deducts $200,
+    sets status → PAID, commits.  Threads 2-N then acquire the lock in turn,
+    read status == PAID, and return immediately (the idempotency guard).
+
+    Expected outcome
+    ----------------
+    ✓  Wallet debited exactly once  → final balance = $300
+    ✓  All threads return PaymentStatus.paid (correct — the payment IS paid)
+    ✓  No errors raised, no double-debit anomaly
+    """
+    WALLET_BALANCE = decimal.Decimal("500")
+    PAYMENT_AMOUNT = decimal.Decimal("200")
+
+    print(f"\n{'─'*60}")
+    print(f"[ISOLATION-2] {n_threads} threads race to process the SAME schedule_id")
+    print(f"  Wallet balance : ${WALLET_BALANCE}")
+    print(f"  Payment amount : ${PAYMENT_AMOUNT}")
+    print(f"  Expected debits: 1  (final balance ${WALLET_BALANCE - PAYMENT_AMOUNT})")
+    print(f"{'─'*60}")
+
+    schedule_id: uuid.UUID
+    bwallet_id:  uuid.UUID
+
+    with get_session() as session:
+        suffix   = uuid.uuid4().hex[:8]
+        lender   = User(full_name="Idem Lender",
+                        email=f"idem_lender_{suffix}@test.com",
+                        password_hash="x", role=UserRole.lender)
+        borrower = User(full_name="Idem Borrower",
+                        email=f"idem_borrower_{suffix}@test.com",
+                        password_hash="x", role=UserRole.borrower)
+        session.add_all([lender, borrower])
+        session.flush()
+
+        l_wallet = Wallet(user_id=lender.user_id,
+                          balance=decimal.Decimal("9999"), currency="USD")
+        b_wallet = Wallet(user_id=borrower.user_id,
+                          balance=WALLET_BALANCE, currency="USD")
+        session.add_all([l_wallet, b_wallet])
+        session.flush()
+        bwallet_id = b_wallet.wallet_id
+
+        loan = GrantedLoan(
+            borrower_id=borrower.user_id, lender_id=lender.user_id,
+            principal_amount=PAYMENT_AMOUNT,
+            interest_rate=decimal.Decimal("5"),
+            term_months=1,
+            start_date=date.today(),
+            end_date=date.today() + timedelta(days=30),
+        )
+        session.add(loan)
+        session.flush()
+
+        sched = PaymentSchedule(
+            loan_id=loan.loan_id,
+            installment_number=1,
+            due_date=date.today() + timedelta(days=30),
+            amount_due=PAYMENT_AMOUNT,
+            principal_portion=PAYMENT_AMOUNT * decimal.Decimal("0.9"),
+            interest_portion=PAYMENT_AMOUNT * decimal.Decimal("0.1"),
+            status=PaymentStatus.scheduled,
+            from_wallet_id=b_wallet.wallet_id,
+            to_wallet_id=l_wallet.wallet_id,
+        )
+        session.add(sched)
+        session.flush()
+        schedule_id = sched.schedule_id
+
+    errors:  List[str]         = []
+    results: List[PaymentStatus] = []
+    barrier  = threading.Barrier(n_threads)
+
+    def run() -> None:
+        try:
+            barrier.wait()
+            status = op_process_payment(schedule_id)  # SAME id for every thread
+            results.append(status)
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=run) for _ in range(n_threads)]
+    t_start = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.perf_counter() - t_start
+
+    with get_session() as session:
+        final = session.query(Wallet).filter_by(wallet_id=bwallet_id).one().balance
+
+    correct_bal = final == WALLET_BALANCE - PAYMENT_AMOUNT
+
+    print(f"  Elapsed        : {elapsed:.3f} s")
+    print(f"  Thread results : {len(results)} returned, {len(errors)} errored")
+    print(f"  Final balance  : ${final}  (expected ${WALLET_BALANCE - PAYMENT_AMOUNT})")
+    print()
+    if correct_bal and not errors:
+        print("  RESULT: PASS — wallet debited exactly once. Idempotency guard works.")
+    else:
+        print("  RESULT: FAIL — double-debit anomaly detected!")
+        if not correct_bal:
+            print(f"    ↳ Final balance ${final} ≠ expected ${WALLET_BALANCE - PAYMENT_AMOUNT}.")
+        for e in errors[:3]:
+            print(f"    ↳ {e}")
+
+
+# ─── ISOLATION-3: concurrent match approval ───────────────────────────────────────
+
+def isolation_test_concurrent_match_approval(n_threads: int = 5) -> None:
+    """
+    ISOLATION TEST 3 — Proves that concurrent lender approvals of the same
+    LoanMatch result in exactly one GrantedLoan and exactly one fund transfer,
+    never two.
+
+    Scenario
+    --------
+    • A LoanMatch already approved by the borrower (lender_status = pending).
+    • n_threads simultaneously call op_approve_match(match_id, "lender").
+
+    Mechanism
+    ---------
+    Thread 1 acquires SELECT FOR UPDATE on the match row, sets lender_status →
+    approved, creates the GrantedLoan, transfers funds, commits.
+    Thread 2 then acquires the lock, also sees both sides approved, tries to
+    INSERT a second GrantedLoan — but match_id has a UNIQUE constraint, so
+    Postgres raises IntegrityError; get_session() rolls back the whole
+    transaction (including any wallet changes).
+
+    Two lines of defence working together:
+      1. SELECT FOR UPDATE — serialises access to the match row
+      2. UNIQUE constraint on granted_loans.match_id — final safety net
+
+    Expected outcome
+    ----------------
+    ✓  Exactly 1 GrantedLoan in the database
+    ✓  Lender wallet debited exactly once
+    ✓  n_threads − 1 IntegrityErrors (all rolled back, no data corruption)
+    """
+    LENDER_BALANCE = decimal.Decimal("5000")
+    LOAN_AMOUNT    = decimal.Decimal("1000")
+
+    print(f"\n{'─'*60}")
+    print(f"[ISOLATION-3] {n_threads} threads race to approve the same LoanMatch")
+    print(f"  Lender balance : ${LENDER_BALANCE}")
+    print(f"  Loan amount    : ${LOAN_AMOUNT}")
+    print(f"  Expected loans : 1")
+    print(f"{'─'*60}")
+
+    match_id:   uuid.UUID
+    lwallet_id: uuid.UUID
+    bwallet_id: uuid.UUID
+
+    with get_session() as session:
+        suffix   = uuid.uuid4().hex[:8]
+        lender   = User(full_name="Approve Lender",
+                        email=f"app_lender_{suffix}@test.com",
+                        password_hash="x", role=UserRole.lender)
+        borrower = User(full_name="Approve Borrower",
+                        email=f"app_borrower_{suffix}@test.com",
+                        password_hash="x", role=UserRole.borrower)
+        session.add_all([lender, borrower])
+        session.flush()
+
+        l_wallet = Wallet(user_id=lender.user_id,
+                          balance=LENDER_BALANCE, currency="USD")
+        b_wallet = Wallet(user_id=borrower.user_id,
+                          balance=decimal.Decimal("100"), currency="USD")
+        session.add_all([l_wallet, b_wallet])
+        session.flush()
+        lwallet_id = l_wallet.wallet_id
+        bwallet_id = b_wallet.wallet_id
+
+        offer = LendingOffer(
+            lender_id=lender.user_id,
+            available_amount=LOAN_AMOUNT,
+            interest_rate=decimal.Decimal("8"),
+            min_term_months=6,
+            max_term_months=12,
+            min_credit_score=0,
+        )
+        session.add(offer)
+        session.flush()
+
+        request = LoanRequest(
+            borrower_id=borrower.user_id,
+            amount=LOAN_AMOUNT,
+            purpose="personal",
+            term_months=6,
+            max_interest_rate=decimal.Decimal("10"),
+        )
+        session.add(request)
+        session.flush()
+
+        # Borrower already approved; lender side is still pending
+        match = LoanMatch(
+            request_id=request.request_id,
+            offer_id=offer.offer_id,
+            initiated_by=InitiatedBy.borrower,
+            borrower_status=MatchStatus.approved,
+            lender_status=MatchStatus.pending,
+        )
+        session.add(match)
+        session.flush()
+        match_id = match.match_id
+
+    errors:   List[str]      = []
+    loan_ids: List[uuid.UUID] = []
+    barrier   = threading.Barrier(n_threads)
+
+    def run() -> None:
+        try:
+            barrier.wait()
+            result = op_approve_match(match_id, "lender")
+            if result is not None:
+                loan_ids.append(result)
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=run) for _ in range(n_threads)]
+    t_start = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.perf_counter() - t_start
+
+    with get_session() as session:
+        loan_count = (
+            session.query(GrantedLoan).filter_by(match_id=match_id).count()
+        )
+        l_final = session.query(Wallet).filter_by(wallet_id=lwallet_id).one().balance
+        b_final = session.query(Wallet).filter_by(wallet_id=bwallet_id).one().balance
+
+    expected_lender   = LENDER_BALANCE - LOAN_AMOUNT
+    expected_borrower = decimal.Decimal("100") + LOAN_AMOUNT
+    correct_loans     = loan_count == 1
+    correct_lender    = l_final == expected_lender
+    correct_borrower  = b_final == expected_borrower
+
+    print(f"  Elapsed         : {elapsed:.3f} s")
+    print(f"  Loans created   : {loan_count}   (expected 1)")
+    print(f"  Lender balance  : ${l_final}  (expected ${expected_lender})")
+    print(f"  Borrower balance: ${b_final}  (expected ${expected_borrower})")
+    print(f"  Thread errors   : {len(errors)}  "
+          f"(expected {n_threads - 1} IntegrityErrors)")
+    if errors:
+        for e in errors[:3]:
+            print(f"    ↳ {e}")
+    print()
+    if correct_loans and correct_lender and correct_borrower:
+        print("  RESULT: PASS — exactly one loan created. Concurrent approvals are safe.")
+    else:
+        print("  RESULT: FAIL — duplicate loan or incorrect wallet balances!")
+        if not correct_loans:
+            print(f"    ↳ {loan_count} loans created; expected 1.")
+        if not correct_lender:
+            print(f"    ↳ Lender balance ${l_final} ≠ expected ${expected_lender}.")
+        if not correct_borrower:
+            print(f"    ↳ Borrower balance ${b_final} ≠ expected ${expected_borrower}.")
+
+
+# ─── ISOLATION-4: concurrent duplicate email signup ──────────────────────────────
+
+def isolation_test_unique_email_signup(n_threads: int = 10) -> None:
+    """
+    ISOLATION TEST 4 — Proves that concurrent registrations with the same email
+    address result in exactly one user row, enforced by the UNIQUE constraint on
+    users.email, and that no orphaned wallet rows are left behind.
+
+    Scenario
+    --------
+    • n_threads simultaneously call op_create_user() with the same email.
+    • Each call is a single transaction: INSERT user → flush → INSERT wallet.
+
+    Mechanism
+    ---------
+    Postgres serialises the concurrent INSERTs at the unique index level.
+    The first transaction to commit acquires the index slot; all subsequent
+    attempts to INSERT the same email block until the winner commits, then fail
+    with IntegrityError.  Because user + wallet live in the same transaction,
+    the wallet INSERT is also rolled back — no orphaned rows.
+
+    Expected outcome
+    ----------------
+    ✓  Exactly 1 user row for that email in the database
+    ✓  Exactly 1 wallet for that user (no orphans)
+    ✓  n_threads − 1 IntegrityErrors (all rolled back atomically)
+    """
+    shared_email = f"dupe_{uuid.uuid4().hex[:8]}@test.com"
+
+    print(f"\n{'─'*60}")
+    print(f"[ISOLATION-4] {n_threads} threads race to register with the same email")
+    print(f"  Email          : {shared_email}")
+    print(f"  Expected users : 1")
+    print(f"{'─'*60}")
+
+    errors:  List[str]      = []
+    created: List[uuid.UUID] = []
+    barrier  = threading.Barrier(n_threads)
+
+    def run() -> None:
+        try:
+            barrier.wait()
+            uid = op_create_user(
+                full_name="Duplicate User",
+                email=shared_email,
+                password_hash="x",
+                role=UserRole.borrower,
+                initial_balance=decimal.Decimal("100"),
+            )
+            created.append(uid)
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=run) for _ in range(n_threads)]
+    t_start = time.perf_counter()
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    elapsed = time.perf_counter() - t_start
+
+    with get_session() as session:
+        user_count = session.query(User).filter_by(email=shared_email).count()
+        # Wallet count should equal user count — proves atomicity (no orphans)
+        wallet_count = (
+            session.query(Wallet)
+            .join(User, Wallet.user_id == User.user_id)
+            .filter(User.email == shared_email)
+            .count()
+        )
+
+    exactly_one_user   = user_count == 1
+    no_orphaned_wallet = wallet_count == user_count
+
+    print(f"  Elapsed        : {elapsed:.3f} s")
+    print(f"  Users created  : {user_count}   (expected 1)")
+    print(f"  Wallets created: {wallet_count}  (expected 1, proves atomicity)")
+    print(f"  Thread errors  : {len(errors)}  (expected {n_threads - 1})")
+    if errors:
+        for e in errors[:3]:
+            print(f"    ↳ {e}")
+    print()
+    if exactly_one_user and no_orphaned_wallet:
+        print("  RESULT: PASS — unique constraint enforced. No duplicate users or orphans.")
+    else:
+        print("  RESULT: FAIL — duplicate user or orphaned wallet detected!")
+        if not exactly_one_user:
+            print(f"    ↳ {user_count} users found; expected 1.")
+        if not no_orphaned_wallet:
+            print(f"    ↳ {wallet_count} wallets for {user_count} user(s) — atomicity broken.")
+
+
 # ─── Demo entry point ─────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -320,15 +696,15 @@ def main() -> None:
     print("=" * 60)
 
     # 1. Schema
-    print("\n[1/6] Creating tables...")
+    print("\n[1/9] Creating tables...")
     create_tables()
 
     # 2. Sample data
-    print("\n[2/6] Populating sample data...")
+    print("\n[2/9] Populating sample data...")
     populate_sample_data()
 
     # 3. Walk through all five business operations
-    print("\n[3/6] Business operations demo...")
+    print("\n[3/9] Business operations demo...")
 
     lender_id = op_create_user(
         "Frank Funds", "frank@demo.com", "$2b$12$frank",
@@ -375,16 +751,28 @@ def main() -> None:
     print(f"  OP-5 process_payment → status={status}")
 
     # 4. Performance — user creation
-    print("\n[4/6] Performance test — user creation...")
+    print("\n[4/9] Performance test — user creation...")
     perf_test_create_users(n=500)
 
     # 5. Performance — payment processing
-    print("\n[5/6] Performance test — payment processing...")
+    print("\n[5/9] Performance test — payment processing...")
     perf_test_process_payments(n=500)
 
-    # 6. Isolation
-    print("\n[6/6] Isolation test — concurrent wallet debits...")
+    # 6. Isolation — concurrent wallet debits (original test)
+    print("\n[6/9] Isolation test — concurrent wallet debits...")
     isolation_test_concurrent_payments(n_threads=10)
+
+    # 7. Isolation — idempotent payment (same schedule, N threads)
+    print("\n[7/9] Isolation test — idempotent payment processing...")
+    isolation_test_idempotent_payment(n_threads=10)
+
+    # 8. Isolation — concurrent match approval
+    print("\n[8/9] Isolation test — concurrent match approval...")
+    isolation_test_concurrent_match_approval(n_threads=5)
+
+    # 9. Isolation — duplicate email signup
+    print("\n[9/9] Isolation test — concurrent duplicate email signup...")
+    isolation_test_unique_email_signup(n_threads=10)
 
     print("\n" + "=" * 60)
     print("  All done.")
