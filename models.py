@@ -122,7 +122,7 @@ class User(Base):
 
     user_id       = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     full_name     = Column(String(200), nullable=False)
-    email         = Column(String(255), nullable=False, unique=True)
+    email         = Column(String(255), nullable=False)
     password_hash = Column(Text, nullable=False)
     role          = Column(Enum(UserRole, name="user_role"), nullable=False)
     created_at    = Column(DateTime, default=datetime.utcnow)
