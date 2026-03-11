@@ -29,6 +29,8 @@ Functions
   2. perf_test_insert(n)               — insert n records concurrently, report RPS
   3. update_schedule_status(...)        — update status (+ paid_at) of a record
   4. perf_test_update(schedule_keys)   — update a list of records concurrently, report RPS
+  5. batch_insert_payment_schedules(items) — insert up to 25 items in one HTTP request
+  6. perf_test_batch_insert(n)         — batch-insert n records concurrently, report RPS
 """
 
 import boto3
@@ -46,6 +48,7 @@ from decimal import Decimal
 AWS_REGION  = "ap-southeast-7"
 TABLE_NAME  = "PaymentSchedules"
 MAX_WORKERS = 200   # concurrent threads for load tests
+BATCH_SIZE  = 25    # DynamoDB hard limit: max 25 items per batch_write_item call
 
 dynamodb        = boto3.resource("dynamodb", region_name=AWS_REGION)
 dynamodb_client = boto3.client  ("dynamodb", region_name=AWS_REGION)
@@ -281,6 +284,107 @@ def perf_test_update(schedule_keys: list[dict]) -> None:
 
 
 # ─────────────────────────────────────────────
+# 5. BATCH INSERT — up to 25 items per HTTP request
+# ─────────────────────────────────────────────
+def batch_insert_payment_schedules(items: list[dict]) -> list[dict]:
+    """
+    Write a batch of up to 25 PaymentSchedule items in a single HTTP request.
+
+    Uses the high-level boto3 Table.batch_writer() which:
+      - Handles DynamoDB's wire format automatically (no manual {"S": ...} typing)
+      - Buffers writes and flushes in groups of 25
+      - Automatically retries UnprocessedItems with back-off
+
+    Returns a list of {"loan_id": ..., "schedule_id": ...} for every item written.
+    """
+    if len(items) > BATCH_SIZE:
+        raise ValueError(f"batch_insert_payment_schedules accepts at most {BATCH_SIZE} items, got {len(items)}")
+
+    with table.batch_writer() as batch:
+        for item in items:
+            batch.put_item(Item=item)
+
+    return [
+        {"loan_id": item["loan_id"], "schedule_id": item["schedule_id"]}
+        for item in items
+    ]
+
+
+# ─────────────────────────────────────────────
+# 6. PERFORMANCE TEST — batch inserts
+# ─────────────────────────────────────────────
+def perf_test_batch_insert(n: int = 50_000) -> list[dict]:
+    """
+    Insert `n` PaymentSchedule records using batch_write_item (25 items per request).
+
+    50,000 records → 2,000 batches sent concurrently via thread pool.
+    Compare RPS with perf_test_insert to see the batching speedup.
+    Returns inserted keys for use in perf_test_update.
+    """
+    print(f"\n[batch-insert-perf] Starting batch insert of {n:,} records ({n // BATCH_SIZE} batches of {BATCH_SIZE}) …")
+
+    today         = date.today()
+    interest_rate = 0.08 / 12
+
+    # Pre-generate all item dicts before starting the timer
+    all_items = []
+    for _ in range(n):
+        p           = round(random.uniform(100, 4000), 2)
+        interest    = round(p * interest_rate, 2)
+        now         = datetime.now(timezone.utc).isoformat()
+        schedule_id = str(uuid.uuid4())
+        loan_id     = str(uuid.uuid4())
+        due_date    = (today + timedelta(days=30 * random.randint(1, 36))).isoformat()
+        all_items.append({
+            "loan_id":            loan_id,
+            "schedule_id":        schedule_id,
+            "borrower_id":        str(uuid.uuid4()),
+            "lender_id":          str(uuid.uuid4()),
+            "from_wallet_id":     str(uuid.uuid4()),
+            "to_wallet_id":       str(uuid.uuid4()),
+            "installment_number": random.randint(1, 36),
+            "amount_due":         Decimal(str(round(p + interest, 2))),
+            "principal_portion":  Decimal(str(p)),
+            "interest_portion":   Decimal(str(interest)),
+            "status":             "scheduled",
+            "due_date":           due_date,
+            "updated_at":         now,
+        })
+
+    # Split into chunks of BATCH_SIZE
+    batches = [all_items[i: i + BATCH_SIZE] for i in range(0, n, BATCH_SIZE)]
+
+    inserted_keys: list[dict] = []
+    errors = 0
+
+    def _write_batch(batch: list[dict]) -> list[dict] | None:
+        try:
+            return batch_insert_payment_schedules(batch)
+        except (ClientError, RuntimeError):
+            return None
+
+    t0 = time.perf_counter()
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = [executor.submit(_write_batch, b) for b in batches]
+        for future in as_completed(futures):
+            result = future.result()
+            if result:
+                inserted_keys.extend(result)
+            else:
+                errors += BATCH_SIZE   # whole batch failed
+
+    elapsed = time.perf_counter() - t0
+    success = len(inserted_keys)
+    rps     = success / elapsed
+
+    print(f"[batch-insert-perf] Done in {elapsed:.2f}s")
+    print(f"[batch-insert-perf] Inserted : {success:,}  |  Errors: {errors:,}")
+    print(f"[batch-insert-perf] Throughput: {rps:,.0f} RPS")
+
+    return inserted_keys
+
+
+# ─────────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────────
 if __name__ == "__main__":
@@ -309,8 +413,14 @@ if __name__ == "__main__":
     )
     print(f"[smoke] Updated attributes: {updated}")
 
-    # 3. Insert performance test  (50 000 records)
+    # 3. Insert performance test — one request per record
     inserted_keys = perf_test_insert(n=50_000)
 
     # 4. Update performance test  (all records just inserted)
     perf_test_update(schedule_keys=inserted_keys)
+
+    # 5. Batch insert performance test — 25 records per request (2 000 batches)
+    batch_keys = perf_test_batch_insert(n=50_000)
+
+    # 6. Update the batch-inserted records to show both paths work end-to-end
+    perf_test_update(schedule_keys=batch_keys)
